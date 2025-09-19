@@ -13,6 +13,9 @@ from torch_utils import misc
 from torch_utils.ops import conv2d_gradfix
 from DiffAugment_pytorch import DiffAugment
 
+from PIL import Image
+import torchvision.transforms as transforms
+
 #----------------------------------------------------------------------------
 def shifted(img) :
     min_shift = 10
@@ -144,7 +147,7 @@ class Loss:
 #----------------------------------------------------------------------------
 
 class StyleGAN2Loss(Loss):
-    def __init__(self, device, G_mapping, G_synthesis, D, diffaugment='', augment_pipe=None, style_mixing_prob=0.9, r1_gamma=10, pl_batch_shrink=2, pl_decay=0.01, pl_weight=2, with_dataaug=False):
+    def __init__(self, device, G_mapping, G_synthesis, D, diffaugment='', augment_pipe=None, style_mixing_prob=0.9, r1_gamma=10, pl_batch_shrink=2, pl_decay=0.01, pl_weight=2, with_dataaug=False, lambda_nda=0.2, nda_method='jigsaw'):
         super().__init__()
         self.device = device
         self.G_mapping = G_mapping
@@ -158,8 +161,10 @@ class StyleGAN2Loss(Loss):
         self.pl_decay = pl_decay
         self.pl_weight = pl_weight
         self.pl_mean = torch.zeros([], device=device)
-        self.with_dataaug = with_dataaug
+        self.with_dataaug = with_dataaug # Not implemented?
         self.pseudo_data = None
+        self.lambda_nda = lambda_nda
+        self.nda_method = nda_method
 
     def run_G(self, z, c, sync):
         with misc.ddp_sync(self.G_mapping, sync):
@@ -188,9 +193,23 @@ class StyleGAN2Loss(Loss):
                                   pseudo_flag, torch.zeros_like(pseudo_flag))
         if torch.allclose(pseudo_flag, torch.zeros_like(pseudo_flag)):
             assert self.pseudo_data is not None
-            return 0.2 * self.pseudo_data * (1 - pseudo_flag) + 0.8 * gen_img * (1 + 0.25 * pseudo_flag)
+            return  (1 - self.lambda_nda) * (1 + (self.lambda_nda / (1 - self.lambda_nda)) * pseudo_flag) * gen_img  + self.lambda_nda * (1 - pseudo_flag) * self.pseudo_data
         else:            
             return gen_img
+        
+    #Function to select the relevant method based on user variable nda_method
+    def select_augmentation(self, real_img):
+        methods = {
+            'jigsaw': lambda x: jigsaw_k(x, k=2),
+            'stitch': lambda x: stitch(x, k=2),
+            'mixup': lambda x: mixup(x, alpha=25.0),
+            'cutout': cutout,
+            'cutmix': cut_mix,
+        }
+        try:
+            return methods[self.nda_method](real_img)
+        except KeyError:
+            raise ValueError(f"Unknown nda_method: {self.nda_method}")
 
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, sync, gain):
         assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
@@ -204,7 +223,7 @@ class StyleGAN2Loss(Loss):
             with torch.autograd.profiler.record_function('Gmain_forward'):
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c, sync=(sync and not do_Gpl)) # May get synced by Gpl.
                 # Update pseudo data
-                self.pseudo_data = jigsaw_k(real_img, k=2)
+                self.pseudo_data = self.select_augmentation(real_img)
                 gen_logits = self.run_D(gen_img, gen_c, sync=False)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())

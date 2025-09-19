@@ -9,6 +9,7 @@
 """Train a GAN using the techniques described in the paper
 "Training Generative Adversarial Networks with Limited Data"."""
 
+
 import os
 import click
 import re
@@ -54,6 +55,7 @@ def setup_training_loop_kwargs(
     p          = None, # Specify p for 'fixed' (required): <float>
     target     = None, # Override ADA target for 'ada': <float>, default = depends on aug
     augpipe    = None, # Augmentation pipeline: 'blit', 'geom', 'color', 'filter', 'noise', 'cutout', 'bg', 'bgc' (default), ..., 'bgcfnc'
+    ada_kimg   = None, # ADA adjustment speed: <int>, default = 500
 
     # Transfer learning.
     resume     = None, # Load previous network: 'noresume' (default), 'ffhq256', 'ffhq512', 'ffhq1024', 'celebahq256', 'lsundog256', <file>, <url>
@@ -65,6 +67,10 @@ def setup_training_loop_kwargs(
     allow_tf32 = None, # Allow PyTorch to use TF32 for matmul and convolutions: <bool>, default = False
     nobench    = None, # Disable cuDNN benchmarking: <bool>, default = False
     workers    = None, # Override number of DataLoader workers: <int>, default = 3
+
+    # ANDA options
+    lambda_nda = None, # weight for negative samples in discriminator loss: <float>, default = 0.2
+    nda_method = None, # method for generating negative samples: 'jigsaw' (default), 'stitch', 'mixup', 'cutout', 'cutmix'
 ):
     args = dnnlib.EasyDict()
 
@@ -153,8 +159,12 @@ def setup_training_loop_kwargs(
     desc += f'-{cfg}'
 
     cfg_specs = {
-        'low_shot':  dict(ref_gpus=-1, kimg=2000,    mb=4,  mbstd=8,  fmaps=1,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=2, snap=10),
-        'auto':      dict(ref_gpus=-1, kimg=25000,  mb=-1, mbstd=-1, fmaps=-1,  lrate=-1,     gamma=-1,   ema=-1,  ramp=0.05, map=2), # Populated dynamically based on resolution and GPU count.
+        'low_shot_min':  dict(ref_gpus=-1, kimg=520,    mb=4,  mbstd=4,  fmaps=0.5,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=2, snap=10),
+        'low_shot':  dict(ref_gpus=-1, kimg=520,    mb=4,  mbstd=4,  fmaps=1,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=2, snap=10),
+        # 'low_shot':  dict(ref_gpus=1, kimg=520,    mb=16,  mbstd=4,  fmaps=0.5,   lrate=0.0025,  gamma=10,   ema=5,  ramp=None, map=2, snap=10),
+        'low_shot_00019':  dict(ref_gpus=1, kimg=520,    mb=16,  mbstd=4,  fmaps=0.5,   lrate=0.0025,  gamma=0.8192,   ema=5,  ramp=None, map=2, snap=10),
+        'low_shot_std':  dict(ref_gpus=1, kimg=520,    mb=4,  mbstd=4,  fmaps=1,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=2, snap=10),
+        'auto':      dict(ref_gpus=-1, kimg=1000,  mb=-1, mbstd=-1, fmaps=-1,  lrate=-1,     gamma=-1,   ema=-1,  ramp=None, map=2, snap=10), # Populated dynamically based on resolution and GPU count.
         'stylegan2': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=8), # Uses mixed-precision, unlike the original StyleGAN2.
         'paper256':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=0.5, lrate=0.0025, gamma=1,    ema=20,  ramp=None, map=8),
         'paper512':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=1,   lrate=0.0025, gamma=0.5,  ema=20,  ramp=None, map=8),
@@ -233,6 +243,7 @@ def setup_training_loop_kwargs(
 
     if diffaugment is None:
         diffaugment = 'color,translation,cutout'
+        print(diffaugment)
 
     if diffaugment:
         args.loss_kwargs.diffaugment = diffaugment
@@ -283,6 +294,15 @@ def setup_training_loop_kwargs(
             raise UserError('--augpipe cannot be specified with --aug=noaug')
         desc += f'-{augpipe}'
 
+    if ada_kimg is None:
+        args.ada_kimg = 500
+    else:
+        assert isinstance(ada_kimg, int)
+        if not ada_kimg >= 1:
+            raise UserError('--ada_kimg must be at least 1')
+        args.ada_kimg = ada_kimg
+        desc += f'-adaKimg{ada_kimg:d}'
+
     augpipe_specs = {
         'blit':   dict(xflip=1, rotate90=1, xint=1),
         'geom':   dict(scale=1, rotate=1, aniso=1, xfrac=1),
@@ -300,6 +320,22 @@ def setup_training_loop_kwargs(
     assert augpipe in augpipe_specs
     if aug != 'noaug':
         args.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', **augpipe_specs[augpipe])
+
+    if lambda_nda is not None:
+        assert isinstance(lambda_nda, float)
+        if not 0 <= lambda_nda <= 1:
+            raise UserError('--lambda_nda must be between 0 and 1')
+        desc += f'-lambda_nda{lambda_nda:g}'
+        args.loss_kwargs.lambda_nda = lambda_nda
+    else:
+        args.loss_kwargs.lambda_nda = 0.2 # default value
+
+    if nda_method is not None:
+        assert isinstance(nda_method, str)
+        desc += f'-nda_method{nda_method}'
+        args.loss_kwargs.nda_method = nda_method
+    else:
+        args.loss_kwargs.nda_method = 'jigsaw' # default value
 
     # ----------------------------------
     # Transfer learning: resume, freezed
@@ -428,7 +464,7 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--mirror', help='Enable dataset x-flips [default: false]', type=bool, metavar='BOOL')
 
 # Base config.
-@click.option('--cfg', help='Base config [default: low_shot]', type=click.Choice(['low_shot', 'auto', 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar']))
+@click.option('--cfg', help='Base config [default: low_shot]', type=click.Choice(['low_shot_min', 'low_shot', 'low_shot_std', 'auto', 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar']))
 @click.option('--gamma', help='Override R1 gamma', type=float)
 @click.option('--kimg', help='Override training duration', type=int, metavar='INT')
 @click.option('--batch', help='Override batch size', type=int, metavar='INT')
@@ -437,6 +473,7 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--DiffAugment', help='Comma-separated list of DiffAugment policy [default: color,translation,cutout]', type=str)
 @click.option('--aug', help='Augmentation mode [default: ada]', type=click.Choice(['noaug', 'ada', 'fixed']))
 @click.option('--p', help='Augmentation probability for --aug=fixed', type=float)
+@click.option('--ada_kimg', help='ADA adjustment speed [default: 500]', type=int, metavar='INT')
 @click.option('--target', help='ADA target value for --aug=ada', type=float)
 @click.option('--augpipe', help='Augmentation pipeline [default: bgc]', type=click.Choice(['blit', 'geom', 'color', 'filter', 'noise', 'cutout', 'bg', 'bgc', 'bgcf', 'bgcfn', 'bgcfnc']))
 
@@ -451,11 +488,20 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--allow-tf32', help='Allow PyTorch to use TF32 internally', type=bool, metavar='BOOL')
 @click.option('--workers', help='Override number of DataLoader workers', type=int, metavar='INT')
 
+# ANDA options
+@click.option('--lambda_nda', help='Weight for negative samples in discriminator loss [default: 0.2]', type=float, metavar='FLOAT')
+@click.option('--nda_method', help='Method for generating negative samples [default: random]', type=click.Choice(['jigsaw','stitch','mixup','cutout','cutmix']))
+
 def main(ctx, outdir, dry_run, **config_kwargs):
     """Train a GAN using the techniques described in the paper
     "Training Generative Adversarial Networks with Limited Data".
 
     Examples:
+
+    \b
+    # Train with custom dataset using 1 GPU.
+
+    python train.py --outdir=./training-runs --mirror=true --data=../data/100-shot-obama.zip --gpus=1 --workers=8 --DiffAugment='flip' --allow-tf32=True
 
     \b
     # Train with custom dataset using 1 GPU.
